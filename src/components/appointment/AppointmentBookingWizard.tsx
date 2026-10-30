@@ -185,6 +185,8 @@ export const AppointmentBookingWizard: React.FC<AppointmentBookingWizardProps> =
   const [isEmergencyDetected, setIsEmergencyDetected] = useState(false);
   const [aiCallFailed, setAiCallFailed] = useState(false);
   const [aiErrorMessage, setAiErrorMessage] = useState<string | null>(null);
+  const [aiErrorCode, setAiErrorCode] = useState<string | null>(null);
+  const [aiSuggestionSource, setAiSuggestionSource] = useState<'ai' | 'keywords'>('ai');
 
   // -------------------------------------------------------------
   // STEP 2 STATE: FIND & SELECT HOSPITALS
@@ -763,6 +765,7 @@ export const AppointmentBookingWizard: React.FC<AppointmentBookingWizardProps> =
       'heart attack',
       'shortness of breath',
       'difficulty breathing',
+      'breathing difficulty',
       "can't breathe",
       'struggling to breathe',
       'severe bleeding',
@@ -818,6 +821,7 @@ export const AppointmentBookingWizard: React.FC<AppointmentBookingWizardProps> =
   const runSpecialtyMatching = async () => {
     setValidationError(null);
     setAiErrorMessage(null);
+    setAiErrorCode(null);
 
     const combinedText = `${problemSummary} ${voiceTranscript}`.trim();
     const hasMedia = capturedPhotos.length > 0 || attachedFiles.length > 0;
@@ -834,12 +838,35 @@ export const AppointmentBookingWizard: React.FC<AppointmentBookingWizardProps> =
 
     const structuredCase = buildStructuredCaseSummary();
     const isLocalEmergency = checkEmergencyKeywords(combinedText);
-    if (isLocalEmergency) {
-      setIsEmergencyDetected(true);
-    }
-
+    setIsEmergencyDetected(isLocalEmergency);
     setIsMatchingSpecialty(true);
     setAiCallFailed(false);
+
+    const keywordFallback = () => {
+      const lower = combinedText.toLowerCase();
+      if (lower.includes('skin') || lower.includes('rash')) {
+        return { specialty: 'Dermatology' as AllowedSpecialty, reason: 'Skin symptoms suggest a dermatology evaluation.' };
+      }
+      if (lower.includes('bone') || lower.includes('fracture')) {
+        return { specialty: 'Orthopedics' as AllowedSpecialty, reason: 'Bone or fracture symptoms suggest an orthopedic evaluation.' };
+      }
+      if (lower.includes('ear') || lower.includes('throat')) {
+        return { specialty: 'ENT' as AllowedSpecialty, reason: 'Ear or throat symptoms suggest an ENT evaluation.' };
+      }
+      if (lower.includes('child')) {
+        return { specialty: 'Pediatrics' as AllowedSpecialty, reason: 'For a child, pediatric evaluation is suggested.' };
+      }
+      if (lower.includes('pregnancy')) {
+        return { specialty: 'Gynecology' as AllowedSpecialty, reason: 'Pregnancy-related concerns suggest a gynecology evaluation.' };
+      }
+      if (lower.includes('headache')) {
+        return { specialty: 'Neurology' as AllowedSpecialty, reason: 'Headache symptoms suggest a neurology evaluation.' };
+      }
+      if (lower.includes('chest') || lower.includes('heart')) {
+        return { specialty: 'Cardiology' as AllowedSpecialty, reason: 'Chest or heart symptoms suggest a cardiology evaluation.' };
+      }
+      return { specialty: 'General Medicine' as AllowedSpecialty, reason: 'A general clinical evaluation is suggested based on the provided symptoms.' };
+    };
 
     try {
       const response = await fetch('/api/appointments/match-specialty', {
@@ -862,7 +889,12 @@ export const AppointmentBookingWizard: React.FC<AppointmentBookingWizardProps> =
       const alternatives = Array.isArray(data.alternatives)
         ? data.alternatives.filter((a: any) => ALLOWED_SPECIALTIES.includes(a) && a !== chosenSpecialty)
         : [];
+      const usedKeywords = data.source === 'keywords' || Boolean(data.errorCode);
 
+      setAiSuggestionSource(usedKeywords ? 'keywords' : 'ai');
+      setAiCallFailed(usedKeywords);
+      setAiErrorCode(typeof data.errorCode === 'string' ? data.errorCode : null);
+      setAiErrorMessage(usedKeywords ? 'AI matching is unavailable. Showing a local keyword-based suggestion.' : null);
       setMatchedSpecialty(chosenSpecialty as AllowedSpecialty);
       setSuggestedAlternatives(alternatives.slice(0, 2) as AllowedSpecialty[]);
       setAiMatchReason(data.reason || 'General clinical outpatient evaluation recommended based on reported presentation.');
@@ -870,39 +902,14 @@ export const AppointmentBookingWizard: React.FC<AppointmentBookingWizardProps> =
       setIsEmergencyDetected(data.isEmergency === true || isLocalEmergency);
       setHasMatchedOnce(true);
     } catch (err: any) {
-      console.warn('AI Specialty Matching failed, applying fallback:', err);
+      console.warn('Specialty matching endpoint failed; using local keyword fallback:', err);
+      const { specialty, reason } = keywordFallback();
+      setAiSuggestionSource('keywords');
       setAiCallFailed(true);
-      setAiErrorMessage('AI specialty matching is currently unreachable. You can select your specialty manually below.');
-
-      const lower = combinedText.toLowerCase();
-      let fallbackSpec: AllowedSpecialty = 'General Medicine';
-      let reason = 'Clinical presentation suggests outpatient primary evaluation.';
-
-      if (lower.includes('chest') || lower.includes('heart') || lower.includes('palpitation')) {
-        fallbackSpec = 'Cardiology';
-        reason = 'Cardiovascular presentation suggests evaluation with cardiology.';
-      } else if (lower.includes('bone') || lower.includes('joint') || lower.includes('knee') || lower.includes('back')) {
-        fallbackSpec = 'Orthopedics';
-        reason = 'Musculoskeletal or joint symptoms warrant orthopedic evaluation.';
-      } else if (lower.includes('skin') || lower.includes('rash') || lower.includes('itch')) {
-        fallbackSpec = 'Dermatology';
-        reason = 'Cutaneous rash and dermatological symptoms align with dermatology.';
-      } else if (lower.includes('headache') || lower.includes('migraine') || lower.includes('seizure')) {
-        fallbackSpec = 'Neurology';
-        reason = 'Neurological complaints suggest evaluation by a neurologist.';
-      } else if (lower.includes('ear') || lower.includes('nose') || lower.includes('throat')) {
-        fallbackSpec = 'ENT';
-        reason = 'Ear, nose, or throat symptoms suggest examination by an ENT specialist.';
-      } else if (lower.includes('child') || lower.includes('baby')) {
-        fallbackSpec = 'Pediatrics';
-        reason = 'Pediatric age group requires consultation with a pediatrician.';
-      } else if (lower.includes('pregnancy') || lower.includes('period') || lower.includes('gynecol')) {
-        fallbackSpec = 'Gynecology';
-        reason = 'Reproductive health concerns align with gynecology.';
-      }
-
-      setMatchedSpecialty(fallbackSpec);
-      setSuggestedAlternatives(fallbackSpec === 'General Medicine' ? ['Cardiology', 'Other'] : ['General Medicine']);
+      setAiErrorCode('NETWORK');
+      setAiErrorMessage('AI matching is unavailable. Showing a local keyword-based suggestion.');
+      setMatchedSpecialty(specialty);
+      setSuggestedAlternatives(specialty === 'General Medicine' ? ['Cardiology', 'Other'] : ['General Medicine']);
       setAiMatchReason(reason);
       setUrgencyLevel(isLocalEmergency ? 'Urgent' : 'Routine');
       setIsEmergencyDetected(isLocalEmergency);
@@ -2317,7 +2324,9 @@ export const AppointmentBookingWizard: React.FC<AppointmentBookingWizardProps> =
             <div className="bg-white rounded-xl border border-[#E3E8EB] p-5 sm:p-6 space-y-5 animate-in fade-in">
               <div className="flex flex-wrap items-center justify-between gap-2 pb-2 border-b border-[#E3E8EB]">
                 <div>
-                  <h3 className="text-sm font-bold text-slate-900">AI Specialty Recommendation</h3>
+                  <h3 className="text-sm font-bold text-slate-900">
+                    {aiSuggestionSource === 'keywords' ? 'Suggested by keywords' : 'AI Specialty Recommendation'}
+                  </h3>
                   <p className="text-xs text-slate-500">
                     Clinical specialty suggestion based on your reported symptoms and health profile.
                   </p>
@@ -2330,11 +2339,14 @@ export const AppointmentBookingWizard: React.FC<AppointmentBookingWizardProps> =
               </div>
 
               {aiCallFailed && aiErrorMessage && (
-                <div className="p-3 bg-amber-50 border border-amber-200 rounded-lg text-xs text-amber-900 flex items-start gap-2">
-                  <AlertTriangle className="w-4 h-4 text-amber-700 shrink-0 mt-0.5" />
-                  <div>
-                    <span className="font-bold">Notice:</span> {aiErrorMessage}
+                <div>
+                  <div className="p-3 bg-amber-50 border border-amber-200 rounded-lg text-xs text-amber-900 flex items-start gap-2">
+                    <AlertTriangle className="w-4 h-4 text-amber-700 shrink-0 mt-0.5" />
+                    <div>
+                      <span className="font-bold">Notice:</span> {aiErrorMessage}
+                    </div>
                   </div>
+                  {aiErrorCode && <p className="mt-1 text-[10px] text-slate-400">Error code: {aiErrorCode}</p>}
                 </div>
               )}
 

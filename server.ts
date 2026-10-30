@@ -292,6 +292,7 @@ function parseFallbackSpecialty(text: string, voiceTranscript: string = '') {
     'heart attack',
     'shortness of breath',
     'difficulty breathing',
+    'breathing difficulty',
     "can't breathe",
     'struggling to breathe',
     'severe bleeding',
@@ -459,161 +460,139 @@ function parseFallbackSpecialty(text: string, voiceTranscript: string = '') {
 
 // POST /api/appointments/match-specialty
 app.post('/api/appointments/match-specialty', async (req, res) => {
-  try {
-    const { text = '', voiceTranscript = '', photos = [], patientProfile = {} } = req.body;
-    const combinedText = `${text} ${voiceTranscript}`.trim();
+  const validSpecialties = [...ALLOWED_SPECIALTIES];
+  const validSpecialtySet = new Set<string>(validSpecialties);
+  const urgencyValues = ['Routine', 'Soon', 'Urgent'];
 
-    if (!combinedText && photos.length === 0) {
+  const errorStatus = (error: any): string | number | undefined =>
+    error?.status ?? error?.statusCode ?? error?.response?.status ?? error?.code;
+  const errorMessage = (error: any): string =>
+    typeof error?.message === 'string' ? error.message : String(error ?? 'Unknown Gemini error');
+  const isQuotaError = (error: any): boolean =>
+    Number(errorStatus(error)) === 429 || /429|quota|rate.?limit|resource exhausted/i.test(`${errorStatus(error) ?? ''} ${errorMessage(error)}`);
+  const classifyError = (error: any): string => {
+    const status = Number(errorStatus(error));
+    const message = `${errorStatus(error) ?? ''} ${errorMessage(error)}`.toLowerCase();
+    if (isQuotaError(error)) return 'QUOTA';
+    if ([401, 403].includes(status) || /api key|unauthorized|permission denied|unauthenticated/i.test(message)) return 'KEY';
+    if (status === 404 || /model/.test(message)) return 'MODEL';
+    if (/json|parse|schema/.test(message)) return 'PARSE';
+    return 'NETWORK';
+  };
+
+  try {
+    const { text = '', voiceTranscript = '', photos = [], patientProfile = {} } = req.body ?? {};
+    const combinedText = `${text} ${voiceTranscript}`.trim();
+    const photoCount = Array.isArray(photos) ? photos.length : 0;
+
+    if (!combinedText && photoCount === 0) {
       return res.status(400).json({ error: 'Please provide a health problem description or image.' });
     }
 
-    // Check emergency keywords in input
-    const emergencyKeywords = [
-      'chest pain',
-      'pressure in chest',
-      'heart attack',
-      'shortness of breath',
-      'difficulty breathing',
-      "can't breathe",
-      'struggling to breathe',
-      'severe bleeding',
-      'heavy bleeding',
-      'unconscious',
-      'fainted',
-      'passed out',
-      'stroke',
-      'slurred speech',
-      'facial drooping',
-      'sudden weakness',
-      'numbness on one side',
-      'anaphylaxis',
-      'choking',
-    ];
-    const hasEmergencyKeywords = emergencyKeywords.some((kw) => combinedText.toLowerCase().includes(kw));
-
-    if (!aiClient) {
+    const fallbackResponse = (errorCode: string) => {
       const fallback = parseFallbackSpecialty(text, voiceTranscript);
-      return res.json({
+      return {
         ...fallback,
-        isEmergency: fallback.isEmergency || hasEmergencyKeywords,
+        source: 'keywords',
+        errorCode,
         disclaimer: 'AI suggestion, not a diagnosis. A doctor will assess you.',
-      });
+      };
+    };
+
+    const isRealKey = Boolean(apiKey && !/placeholder|MY_GEMINI_API_KEY/i.test(apiKey));
+    if (!aiClient || !isRealKey) {
+      console.error('[specialty-match] Gemini unavailable status=%s message=%s', 'N/A', 'GEMINI_API_KEY is missing or is a placeholder.');
+      return res.json(fallbackResponse('KEY'));
     }
 
-    const systemPrompt = `You are the MediTrack Clinical Triage & Specialty Matcher AI.
-Your purpose is to match a patient's self-reported health symptoms, voice notes, and clinical profile to the most appropriate medical specialty for outpatient scheduling.
+    const userContent = `Patient case for specialty matching:\n- Problem description: ${String(text)}\n- Spoken voice transcript: ${String(voiceTranscript)}\n- Attached media/report count: ${photoCount}\n- Patient profile: age ${patientProfile?.age ?? 'Not specified'}, gender ${patientProfile?.gender ?? 'Not specified'}, chronic conditions: ${Array.isArray(patientProfile?.chronicConditions) ? patientProfile.chronicConditions.join(', ') : 'None reported'}, allergies: ${Array.isArray(patientProfile?.allergies) ? patientProfile.allergies.join(', ') : 'None reported'}`;
+    const responseSchema = {
+      type: Type.OBJECT,
+      properties: {
+        specialty: { type: Type.STRING, enum: validSpecialties },
+        alternatives: { type: Type.ARRAY, items: { type: Type.STRING, enum: validSpecialties } },
+        reason: { type: Type.STRING },
+        urgency: { type: Type.STRING, enum: urgencyValues },
+      },
+      required: ['specialty', 'alternatives', 'reason', 'urgency'],
+    };
+    let response: any;
+    let finalError: any;
 
-ALLOWED SPECIALTIES (you MUST select ONLY from this list):
-- Cardiology
-- Orthopedics
-- Dermatology
-- Neurology
-- General Medicine
-- ENT
-- Pediatrics
-- Gynecology
-- Other
-
-CRITICAL MEDICAL SAFETY DIRECTIVES:
-1. Do NOT diagnose any medical condition, disease, syndrome, or pathology. Do NOT name a disease.
-2. Do NOT prescribe, suggest, or recommend any medications, pharmaceuticals, treatments, or dosages.
-3. Suggest ONLY:
-   - "specialty": one of the 9 allowed specialties above.
-   - "alternatives": up to 2 alternative specialties (also strictly from the 9 allowed specialties above).
-   - "reason": a single one-line clinical triage reason explaining why this specialty department is appropriate for these symptoms. Never diagnose a disease.
-   - "urgency": strictly "Routine", "Soon", or "Urgent".
-4. Flag "isEmergency": true if the symptoms suggest an acute emergency (e.g. chest pain, difficulty breathing / shortness of breath, severe bleeding, loss of consciousness / fainted, stroke signs like facial droop or sudden weakness).
-5. Always return strict JSON in this format:
-{
-  "specialty": "Cardiology" | "Orthopedics" | "Dermatology" | "Neurology" | "General Medicine" | "ENT" | "Pediatrics" | "Gynecology" | "Other",
-  "alternatives": ["string", "string"],
-  "reason": "one-line reason why this specialty was suggested",
-  "urgency": "Routine" | "Soon" | "Urgent",
-  "isEmergency": boolean
-}`;
-
-    const userContent = `Patient Case for Specialty Matching:
-- Problem Description: "${text}"
-- Spoken Voice Transcript: "${voiceTranscript}"
-- Attached Media / Report Count: ${photos.length}
-- Patient Profile: Age ${patientProfile.age ?? 'Not specified'}, Gender ${patientProfile.gender ?? 'Not specified'}, Chronic Conditions: ${(patientProfile.chronicConditions || []).join(', ') || 'None reported'}, Allergies: ${(patientProfile.allergies || []).join(', ') || 'None reported'}`;
-
-    const isRealKey = apiKey && !apiKey.includes('placeholder') && !apiKey.includes('MY_GEMINI_API_KEY');
-    let rawText = '';
-
-    if (isRealKey && aiClient) {
+    for (let attempt = 0; attempt < 2; attempt += 1) {
       try {
-        const timeoutPromise = new Promise((_, reject) =>
-          setTimeout(() => reject(new Error('Gemini API call timed out after 6 seconds')), 6000)
-        );
-        const aiPromise = aiClient.models.generateContent({
-          model: 'gemini-3.8-flash',
+        response = await aiClient.models.generateContent({
+          model: 'gemini-2.5-flash',
           contents: userContent,
           config: {
-            systemInstruction: systemPrompt,
+            systemInstruction: `You are a safe clinical specialty triage assistant. Choose only an allowed outpatient specialty. Do not diagnose or recommend treatment or medication. Return a concise one-line reason. Urgency must be Routine, Soon, or Urgent. Allowed specialties: ${validSpecialties.join(', ')}.`,
             responseMimeType: 'application/json',
+            responseSchema,
           },
         });
-
-        const response: any = await Promise.race([aiPromise, timeoutPromise]);
-        rawText = (response?.text || '{}').trim();
-      } catch (geminiErr) {
-        console.warn('Gemini generateContent error or timeout, falling back:', geminiErr);
-        rawText = '';
+        finalError = undefined;
+        break;
+      } catch (error: any) {
+        finalError = error;
+        const status = errorStatus(error);
+        console.error('[specialty-match] Gemini API error status=%s message=%s', status ?? 'NETWORK', errorMessage(error));
+        if (isQuotaError(error) && attempt === 0) {
+          await new Promise((resolve) => setTimeout(resolve, 500));
+          continue;
+        }
+        break;
       }
     }
 
-    let parsed: any = {};
-    if (rawText) {
-      try {
-        parsed = JSON.parse(rawText);
-      } catch (e) {
-        console.warn('Failed to parse Gemini specialty response as JSON, falling back:', e);
-        parsed = parseFallbackSpecialty(text, voiceTranscript);
+    if (finalError) {
+      return res.json(fallbackResponse(classifyError(finalError)));
+    }
+
+    const rawText = String(response?.text ?? '').trim();
+    const jsonText = rawText
+      .replace(/^```(?:json)?\s*/i, '')
+      .replace(/\s*```$/, '')
+      .trim();
+    let parsed: any;
+    try {
+      parsed = JSON.parse(jsonText);
+      if (
+        !parsed || typeof parsed !== 'object' || Array.isArray(parsed) ||
+        typeof parsed.specialty !== 'string' || !Array.isArray(parsed.alternatives) ||
+        typeof parsed.reason !== 'string' || !urgencyValues.includes(parsed.urgency)
+      ) {
+        throw new Error('Gemini response did not match the expected specialty JSON schema.');
       }
-    } else {
-      parsed = parseFallbackSpecialty(text, voiceTranscript);
+    } catch (error: any) {
+      console.error('[specialty-match] Gemini response validation error status=%s message=%s', 'PARSE', errorMessage(error));
+      return res.json(fallbackResponse('PARSE'));
     }
 
-    // Validate that returned specialty is in the allowed list, otherwise map to General Medicine or Other
-    const validSpecialties = [
-      'Cardiology',
-      'Orthopedics',
-      'Dermatology',
-      'Neurology',
-      'General Medicine',
-      'ENT',
-      'Pediatrics',
-      'Gynecology',
-      'Other',
-    ];
-    let sanitizedSpecialty = validSpecialties.includes(parsed.specialty) ? parsed.specialty : 'General Medicine';
-    let sanitizedAlternatives = Array.isArray(parsed.alternatives)
-      ? parsed.alternatives.filter((alt: string) => validSpecialties.includes(alt) && alt !== sanitizedSpecialty).slice(0, 2)
-      : ['General Medicine'];
-    if (sanitizedAlternatives.length === 0) {
-      sanitizedAlternatives = sanitizedSpecialty === 'General Medicine' ? ['Cardiology', 'Other'] : ['General Medicine'];
-    }
-
-    const urgency: 'Routine' | 'Soon' | 'Urgent' = ['Routine', 'Soon', 'Urgent'].includes(parsed.urgency)
-      ? parsed.urgency
-      : hasEmergencyKeywords
-      ? 'Urgent'
-      : 'Routine';
+    const specialty = typeof parsed.specialty === 'string' && validSpecialtySet.has(parsed.specialty)
+      ? parsed.specialty
+      : 'General Medicine';
+    const alternatives = parsed.alternatives
+      .filter((item: unknown): item is string => typeof item === 'string' && validSpecialtySet.has(item) && item !== specialty)
+      .slice(0, 2);
+    const emergency = parseFallbackSpecialty(text, voiceTranscript).isEmergency;
 
     return res.json({
-      specialty: sanitizedSpecialty,
-      alternatives: sanitizedAlternatives,
-      reason: parsed.reason || 'General clinical evaluation recommended based on described presentation.',
-      urgency,
-      isEmergency: parsed.isEmergency === true || hasEmergencyKeywords,
+      specialty,
+      alternatives,
+      reason: parsed.reason.trim() || 'General clinical evaluation recommended based on reported presentation.',
+      urgency: emergency ? 'Urgent' : parsed.urgency,
+      isEmergency: emergency,
+      source: 'ai',
       disclaimer: 'AI suggestion, not a diagnosis. A doctor will assess you.',
     });
   } catch (error: any) {
-    console.error('Error in /api/appointments/match-specialty:', error);
+    const status = errorStatus(error);
+    console.error('[specialty-match] Endpoint error status=%s message=%s', status ?? 'NETWORK', errorMessage(error));
     const fallback = parseFallbackSpecialty(req.body?.text || '', req.body?.voiceTranscript || '');
     return res.json({
       ...fallback,
+      source: 'keywords',
+      errorCode: classifyError(error),
       disclaimer: 'AI suggestion, not a diagnosis. A doctor will assess you.',
     });
   }
@@ -1797,7 +1776,11 @@ async function startServer() {
   if (process.env.NODE_ENV !== 'production') {
     const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
-      server: { middlewareMode: true, hmr: process.env.DISABLE_HMR !== 'true' },
+      server: {
+        middlewareMode: true,
+        hmr: process.env.DISABLE_HMR !== 'true',
+        allowedHosts: ['.e2b.app'],
+      },
       appType: 'spa',
     });
     app.use(vite.middlewares);
